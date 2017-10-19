@@ -1,37 +1,29 @@
 #!/usr/bin/env python
 """Nagios plugin for Amazon RDS monitoring.
 
-This program is part of $PROJECT_NAME$
+This program is part of Percona Monitoring Plugins
 License: GPL License (see COPYING)
 
 Author Roman Vynar
-Copyright 2014-2016 Percona LLC and/or its affiliates
+Copyright 2014-2015 Percona LLC and/or its affiliates
+
+Modified by Obadah Algorani (adem.noer.2008@gmail.com)
 """
 
 import datetime
 import optparse
-import os
 import pprint
 import sys
-import time
 
 import boto
 import boto.rds
 import boto.ec2.cloudwatch
-
-THROTTLE_FILE = '/tmp/pmp-check-aws-rds.throttle'
 
 # Nagios status codes
 OK = 0
 WARNING = 1
 CRITICAL = 2
 UNKNOWN = 3
-SHORT_STATUS = {
-    OK: 'OK',
-    WARNING: 'WARN',
-    CRITICAL: 'CRIT',
-    UNKNOWN: 'UNK'
-}
 
 
 class RDS(object):
@@ -55,16 +47,8 @@ class RDS(object):
                 try:
                     rds = boto.rds.connect_to_region(reg, profile_name=self.profile)
                     self.info = rds.get_all_dbinstances(self.identifier)
-                except boto.provider.ProfileNotFoundError as msg:
+                except (boto.provider.ProfileNotFoundError, boto.exception.BotoServerError) as msg:
                     debug(msg)
-                except boto.exception.BotoServerError as msg:
-                    debug(msg)
-                    if msg.body.find('Rate exceeded') > 0:
-                        with open(THROTTLE_FILE, 'w') as _file:
-                            _file.write(str(time.time()))
-
-                        print '%s Throttling in progress' % (SHORT_STATUS[UNKNOWN],)
-                        sys.exit(UNKNOWN)
                 else:
                     # Exit on the first region and identifier match
                     self.region = reg
@@ -84,42 +68,23 @@ class RDS(object):
             try:
                 rds = boto.rds.connect_to_region(reg, profile_name=self.profile)
                 result[reg] = rds.get_all_dbinstances()
-            except boto.provider.ProfileNotFoundError as msg:
+            except (boto.provider.ProfileNotFoundError, boto.exception.BotoServerError) as msg:
                 debug(msg)
-            except boto.exception.BotoServerError as msg:
-                debug(msg)
-                if msg.body.find('Rate exceeded') > 0:
-                    with open(THROTTLE_FILE, 'w') as _file:
-                        _file.write(str(time.time()))
-
-                    print '%s Throttling in progress' % (SHORT_STATUS[UNKNOWN],)
-                    sys.exit(UNKNOWN)
 
         return result
 
     def get_metric(self, metric, start_time, end_time, step):
         """Get RDS metric from CloudWatch"""
-        result = None
-        try:
-            cw_conn = boto.ec2.cloudwatch.connect_to_region(self.region, profile_name=self.profile)
-            result = cw_conn.get_metric_statistics(
-                step,
-                start_time,
-                end_time,
-                metric,
-                'AWS/RDS',
-                'Average',
-                dimensions={'DBInstanceIdentifier': [self.identifier]}
-           )
-        except boto.exception.BotoServerError as msg:
-            debug(msg)
-            if msg.body.find('Rate exceeded') > 0:
-                with open(THROTTLE_FILE, 'w') as _file:
-                    _file.write(str(time.time()))
-
-                print '%s Throttling in progress' % (SHORT_STATUS[UNKNOWN],)
-                sys.exit(UNKNOWN)
-
+        cw_conn = boto.ec2.cloudwatch.connect_to_region(self.region, profile_name=self.profile)
+        result = cw_conn.get_metric_statistics(
+            step,
+            start_time,
+            end_time,
+            metric,
+            'AWS/RDS',
+            'Average',
+            dimensions={'DBInstanceIdentifier': [self.identifier]}
+        )
         if result:
             if len(result) > 1:
                 # Get the last point
@@ -141,6 +106,13 @@ def debug(val):
 def main():
     """Main function"""
     global options
+
+    short_status = {
+        OK: 'OK',
+        WARNING: 'WARNING',
+        CRITICAL: 'CRITICAL',
+        UNKNOWN: 'UNKNOWN'
+    }
 
     # DB instance classes as listed on
     # http://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.DBInstanceClass.html
@@ -179,10 +151,13 @@ def main():
         'status': 'RDS availability',
         'load': 'CPUUtilization',
         'memory': 'FreeableMemory',
-        'storage': 'FreeStorageSpace'
+        'storage': 'FreeStorageSpace',
+        'connection': 'DatabaseConnections',
+        'readiops' : 'ReadIOPS',
+        'writeiops' : 'WriteIOPS'
     }
 
-    units = ('percent', 'GB')
+    units = ('percent', 'GB', 'count')
 
     # Parse options
     parser = optparse.OptionParser()
@@ -207,18 +182,7 @@ def main():
                       type='int', default=1)
     parser.add_option('-d', '--debug', help='enable debug output',
                       action='store_true', default=False)
-    parser.add_option('--throttle', help='time in seconds to wait until throttling complete. Default: 5',
-                      type='int', default=5)
     options, _ = parser.parse_args()
-
-    # Check for throttling
-    if os.path.isfile(THROTTLE_FILE):
-        with open(THROTTLE_FILE, 'r') as _file:
-            chk = float(_file.read())
-
-        if time.time() - chk < options.throttle:
-            print '%s Waiting until throttling complete...' % (SHORT_STATUS[UNKNOWN],)
-            sys.exit(UNKNOWN)
 
     if options.debug:
         boto.set_stream_logger('boto')
@@ -298,13 +262,14 @@ def main():
         fail = False
         j = 0
         perf_data = []
-        points = options.time
         for i in [1, 5, 15]:
-            if i == 15:
-                points = max(options.time, 15)
+            if i == 1:
+                # Some stats are delaying to update on CloudWatch.
+                # Let's pick a few points for 1-min load avg and get the last point.
+                points = 5
+            else:
+                points = i
 
-            # The stats are delaying to update on CloudWatch.
-            # Usually, there is no data for the last minute and we should request at least last 5 min. data.
             load = rds.get_metric(metrics[options.metric], now - datetime.timedelta(seconds=points * 60), now, i * 60)
             if not load:
                 status = UNKNOWN
@@ -388,207 +353,134 @@ def main():
             note = 'Free %s: %s GB (%.0f%%) of %s GB' % (options.metric, free, float(free_pct), storage)
             perf_data = 'free_%s=%s;%s;%s;0;%s' % (options.metric, val, warn, crit, val_max)
 
+
+
+    ## Check connection =>
+
+    elif options.metric in ['connection']:
+        # Check thresholds
+        try:
+            warn = int(options.warn)
+            crit = int(options.crit)
+        except:
+            parser.error('Warning and critical thresholds should be integers.')
+
+        if crit < warn:
+            parser.error('Parameter inconsistency: critical threshold is smaller than warning.')
+
+        if options.unit not in units:
+            parser.print_help()
+            parser.error('Unit is not valid.')
+
+        info = rds.get_info()
+        count = rds.get_metric(metrics[options.metric], now - datetime.timedelta(seconds=options.time * 60),
+                              now, options.avg * 60)
+        count = int(count)
+        if not info or not count:
+            status = UNKNOWN
+            note = 'Unable to get RDS details and statistics'
+        else:
+
+            # Compare thresholds
+            if count >= warn:
+                status = WARNING
+                if count >= crit:
+                    status = CRITICAL
+
+            if status is None:
+                status = OK
+
+            note = 'Connection Count is %s' % (count)
+            perf_data = 'worning connection is %s; critical connection is %s;' % (warn, crit)
+
+    ## Check ReadIOPS  =>
+
+    elif options.metric in ['readiops']:
+        # Check thresholds
+        try:
+            warn = int(options.warn)
+            crit = int(options.crit)
+        except:
+            parser.error('Warning and critical thresholds should be integers.')
+
+        if crit < warn:
+            parser.error('Parameter inconsistency: critical threshold is smaller than warning.')
+
+        if options.unit not in units:
+            parser.print_help()
+            parser.error('Unit is not valid.')
+
+        info = rds.get_info()
+        count = rds.get_metric(metrics[options.metric], now - datetime.timedelta(seconds=options.time * 60),
+                              now, options.avg * 60)
+        count = int(count)
+        if not info or not count:
+            status = UNKNOWN
+            note = 'Unable to get RDS details and statistics'
+        else:
+
+            # Compare thresholds
+            if count >= warn:
+                status = WARNING
+                if count >= crit:
+                    status = CRITICAL
+
+            if status is None:
+                status = OK
+
+            note = 'ReadIPOS is %s' % (count)
+            perf_data = 'worning ReadIOPS is %s; critical ReadIOPS is %s;' % (warn, crit)
+
+
+    ## Check WriteIOPS  =>
+
+    elif options.metric in ['writeiops']:
+        # Check thresholds
+        try:
+            warn = int(options.warn)
+            crit = int(options.crit)
+        except:
+            parser.error('Warning and critical thresholds should be integers.')
+
+        if crit < warn:
+            parser.error('Parameter inconsistency: critical threshold is smaller than warning.')
+
+        if options.unit not in units:
+            parser.print_help()
+            parser.error('Unit is not valid.')
+
+        info = rds.get_info()
+        count = rds.get_metric(metrics[options.metric], now - datetime.timedelta(seconds=options.time * 60),
+                              now, options.avg * 60)
+        count = int(count)
+        if not info or not count:
+            status = UNKNOWN
+            note = 'Unable to get RDS details and statistics'
+        else:
+
+            # Compare thresholds
+            if count >= warn:
+                status = WARNING
+                if count >= crit:
+                    status = CRITICAL
+
+            if status is None:
+                status = OK
+
+            note = 'WriteIPOS is %s' % (count)
+            perf_data = 'worning WriteIOPS is %s; critical WriteIOPS is %s;' % (warn, crit)
+
+
+
+
     # Final output
     if status != UNKNOWN and perf_data:
-        print '%s %s | %s' % (SHORT_STATUS[status], note, perf_data)
+        print '%s %s | %s' % (short_status[status], note, perf_data)
     else:
-        print '%s %s' % (SHORT_STATUS[status], note)
+        print '%s %s' % (short_status[status], note)
 
     sys.exit(status)
 
 
 if __name__ == '__main__':
     main()
-
-# ############################################################################
-# Documentation
-# ############################################################################
-"""
-=pod
-
-=head1 NAME
-
-pmp-check-aws-rds.py - Check Amazon RDS metrics.
-
-=head1 SYNOPSIS
-
-  Usage: pmp-check-aws-rds.py [options]
-
-  Options:
-    -h, --help            show this help message and exit
-    -l, --list            list of all DB instances
-    -n PROFILE, --profile-name=PROFILE
-                          AWS profile from ~/.boto or /etc/boto.cfg. Default:
-                          None, fallbacks to "[Credentials]".
-    -r REGION, --region=REGION
-                          AWS region. Default: us-east-1. If set to "all", we
-                          try to detect the instance region across all of them,
-                          note this will be slower than you specify the region.
-    -i IDENT, --ident=IDENT
-                          DB instance identifier
-    -p, --print           print status and other details for a given DB instance
-    -m METRIC, --metric=METRIC
-                          metric to check: [status, load, storage, memory]
-    -w WARN, --warn=WARN  warning threshold
-    -c CRIT, --crit=CRIT  critical threshold
-    -u UNIT, --unit=UNIT  unit of thresholds for "storage" and "memory" metrics:
-                          [percent, GB]. Default: percent
-    -t TIME, --time=TIME  time period in minutes to query. Default: 5
-    -a AVG, --avg=AVG     time average in minutes to request. Default: 1
-    --throttle=TIME       time in seconds to wait until throttling complete. Default: 5
-    -d, --debug           enable debug output
-
-=head1 REQUIREMENTS
-
-This plugin is written on Python and utilizes the module C<boto> (Python interface
-to Amazon Web Services) to get various RDS metrics from CloudWatch and compare
-them against the thresholds.
-
-* Install the package: C<yum install python-boto> or C<apt-get install python-boto>
-* Create a config /etc/boto.cfg or ~nagios/.boto with your AWS API credentials.
-  See http://code.google.com/p/boto/wiki/BotoConfig
-
-This plugin that is supposed to be run by Nagios, i.e. under ``nagios`` user,
-should have permissions to read the config /etc/boto.cfg or ~nagios/.boto.
-
-Example:
-
-  [root@centos6 ~]# cat /etc/boto.cfg
-  [Credentials]
-  aws_access_key_id = THISISATESTKEY
-  aws_secret_access_key = thisisatestawssecretaccesskey
-
-If you do not use this config with other tools such as our Cacti script,
-you can secure this file the following way:
-
-  [root@centos6 ~]# chown nagios /etc/boto.cfg
-  [root@centos6 ~]# chmod 600 /etc/boto.cfg
-
-=head1 DESCRIPTION
-
-The plugin provides 4 checks and some options to list and print RDS details:
-
-* RDS Status
-* RDS Load Average
-* RDS Free Storage
-* RDS Free Memory
-
-To get the list of all RDS instances under AWS account:
-
-  # ./pmp-check-aws-rds.py -l
-
-To get the detailed status of RDS instance identified as C<blackbox>:
-
-  # ./pmp-check-aws-rds.py -i blackbox -p
-
-Nagios check for the overall status. Useful if you want to set the rest
-of the checks dependent from this one:
-
-  # ./pmp-check-aws-rds.py -i blackbox -m status
-  OK mysql 5.1.63. Status: available
-
-Nagios check for CPU utilization, specify thresholds as percentage of
-1-min., 5-min., 15-min. average accordingly:
-
-  # ./pmp-check-aws-rds.py -i blackbox -m load -w 90,85,80 -c 98,95,90
-  OK Load average: 18.36%, 18.51%, 15.95% | load1=18.36;90.0;98.0;0;100 load5=18.51;85.0;95.0;0;100 load15=15.95;80.0;90.0;0;100
-
-Nagios check for the free memory, specify thresholds as percentage:
-
-  # ./pmp-check-aws-rds.py -i blackbox -m memory -w 5 -c 2
-  OK Free memory: 5.90 GB (9%) of 68 GB | free_memory=8.68;5.0;2.0;0;100
-  # ./pmp-check-aws-rds.py -i blackbox -m memory -u GB -w 4 -c 2
-  OK Free memory: 5.90 GB (9%) of 68 GB | free_memory=5.9;4.0;2.0;0;68
-
-Nagios check for the free storage space, specify thresholds as percentage or GB:
-
-  # ./pmp-check-aws-rds.py -i blackbox -m storage -w 10 -c 5
-  OK Free storage: 162.55 GB (33%) of 500.0 GB | free_storage=32.51;10.0;5.0;0;100
-  # ./pmp-check-aws-rds.py -i blackbox -m storage -u GB -w 10 -c 5
-  OK Free storage: 162.55 GB (33%) of 500.0 GB | free_storage=162.55;10.0;5.0;0;500.0
-
-By default, the region is set to ``us-east-1``. You can re-define it globally in boto config or
-specify with -r option. The following command will list all instances across all regions under your AWS account:
-
-  # ./pmp-check-aws-rds.py -r all -l
-
-The following command will show the status for the first instance identified as ``blackbox`` in all regions:
-
-  # ./pmp-check-aws-rds.py -r all -i blackbox -p
-
-Remember, scanning regions are slower operation than specifying it explicitly.
-
-=head1 CONFIGURATION
-
-Here is the excerpt of potential Nagios config:
-
-  define host{
-        use                             mysql-host
-        host_name                       blackbox
-        alias                           blackbox
-        address                         blackbox.abcdefgh.us-east-1.rds.amazonaws.com
-        }
-
-  define servicedependency{
-        host_name                       blackbox
-        service_description             RDS Status
-        dependent_service_description   RDS Load Average, RDS Free Storage, RDS Free Memory
-        execution_failure_criteria      w,c,u,p
-        notification_failure_criteria   w,c,u,p
-        }
-
-  define service{
-        use                             active-service
-        host_name                       blackbox
-        service_description             RDS Status
-        check_command                   check_rds!status!0!0
-        }
-
-  define service{
-        use                             active-service
-        host_name                       blackbox
-        service_description             RDS Load Average
-        check_command                   check_rds!load!90,85,80!98,95,90
-        }
-
-  define service{
-        use                             active-service
-        host_name                       blackbox
-        service_description             RDS Free Storage
-        check_command                   check_rds!storage!10!5
-        }
-
-  define service{
-        use                             active-service
-        host_name                       blackbox
-        service_description             RDS Free Memory
-        check_command                   check_rds!memory!5!2
-        }
-
-  define command{
-        command_name    check_rds
-        command_line    $USER1$/pmp-check-aws-rds.py -i $HOSTALIAS$ -m $ARG1$ -w $ARG2$ -c $ARG3$
-        }
-
-=head1 COPYRIGHT, LICENSE, AND WARRANTY
-
-This program is copyright 2014 Percona LLC and/or its affiliates.
-Feedback and improvements are welcome.
-
-THIS PROGRAM IS PROVIDED "AS IS" AND WITHOUT ANY EXPRESS OR IMPLIED
-WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED WARRANTIES OF
-MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.
-
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation, version 2.  You should have received a copy of the GNU General
-Public License along with this program; if not, write to the Free Software
-Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA.
-
-=head1 VERSION
-
-$PROJECT_NAME$ pmp-check-aws-rds.py $VERSION$
-
-=cut
-
-"""
